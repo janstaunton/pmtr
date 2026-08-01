@@ -8,6 +8,22 @@ import pmtr
 
 
 class KnownNodeParsingTests(unittest.TestCase):
+    def test_trailing_destination_is_not_treated_as_known_node(self):
+        destination, groups = pmtr._split_destination_from_known_nodes(
+            None, [["192.168.0.1,10.0.35.250", "8.8.8.8"]]
+        )
+
+        self.assertEqual(destination, "8.8.8.8")
+        self.assertEqual(pmtr._parse_known_nodes(groups), ["192.168.0.1", "10.0.35.250"])
+
+    def test_explicit_destination_before_known_nodes_is_preserved(self):
+        destination, groups = pmtr._split_destination_from_known_nodes(
+            "1.1.1.1", [["192.168.0.1", "10.0.35.250"]]
+        )
+
+        self.assertEqual(destination, "1.1.1.1")
+        self.assertEqual(pmtr._parse_known_nodes(groups), ["192.168.0.1", "10.0.35.250"])
+
     def test_mixed_forms_are_flattened_and_deduplicated(self):
         self.assertEqual(
             pmtr._parse_known_nodes(

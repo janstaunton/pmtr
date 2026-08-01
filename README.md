@@ -106,6 +106,9 @@ sudo uv run pmtr.py 8.8.8.8 --known-nodes 10.0.0.1 192.0.2.10
 
 # Comma-separated and repeated forms can be combined
 sudo uv run pmtr.py 8.8.8.8 --known-nodes 10.0.0.1,192.0.2.10 --known-nodes 198.51.100.5
+
+# The destination may also follow the known-node option
+sudo uv run pmtr.py --no-web --known-nodes 192.168.0.1,10.0.35.250 8.8.8.8
 ```
 
 ## Keyboard Controls

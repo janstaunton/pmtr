@@ -1868,6 +1868,22 @@ def _parse_known_nodes(groups: list[list[str]]) -> list[str]:
     return nodes
 
 
+def _split_destination_from_known_nodes(
+    destination: str | None, groups: list[list[str]]
+) -> tuple[str, list[list[str]]]:
+    """Recover a trailing destination consumed by ``--known-nodes``.
+
+    ``argparse`` cannot distinguish the final positional from a variable-length
+    option. When no positional was parsed and the final known-node group has
+    multiple values, the last value is the destination. A single value remains
+    a known node and the normal default destination is used.
+    """
+    normalized_groups = [group.copy() for group in groups]
+    if destination is None and normalized_groups and len(normalized_groups[-1]) > 1:
+        destination = normalized_groups[-1].pop()
+    return destination or "8.8.8.8", normalized_groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="pmtr – network path monitor with charts",
@@ -1877,7 +1893,7 @@ def main() -> None:
     parser.add_argument(
         "destination",
         nargs="?",
-        default="8.8.8.8",
+        default=None,
         help="Target host or IP (default: 8.8.8.8)",
     )
     parser.add_argument(
@@ -1947,8 +1963,11 @@ def main() -> None:
         help="ICMP packet size in bytes including header (default: 64)",
     )
     args = parser.parse_args()
+    args.destination, known_node_groups = _split_destination_from_known_nodes(
+        args.destination, args.known_nodes
+    )
     try:
-        known_nodes = _parse_known_nodes(args.known_nodes)
+        known_nodes = _parse_known_nodes(known_node_groups)
     except argparse.ArgumentTypeError as exc:
         parser.error(str(exc))
 
