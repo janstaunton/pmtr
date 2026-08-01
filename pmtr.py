@@ -34,9 +34,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import deque
-from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import ipaddress
+import itertools
 import json
 import os
 import queue
@@ -49,7 +48,11 @@ import termios
 import threading
 import time
 import tty
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import plotext as plt
 from rich.console import Console
@@ -116,6 +119,7 @@ class HopStats:
     hop: int
     ip: str
     hostname: str
+    manual: bool = False
     sent: int = 0
     received: int = 0
     last_ms: float | None = None
@@ -158,7 +162,12 @@ class HopStats:
     @property
     def jitter_ms(self) -> float | None:
         """Jitter: stddev of last 20 non-None RTT samples."""
-        rtts = [rtt for _, rtt in list(self.history)[-80:] if rtt is not None]
+        # Iterate only the last 80 entries without copying the full deque
+        rtts = [
+            rtt
+            for _, rtt in itertools.islice(reversed(self.history), 80)
+            if rtt is not None
+        ]
         if len(rtts) < 2:
             return None
         mean = sum(rtts) / len(rtts)
@@ -199,6 +208,7 @@ class HopSnapshot:
     hostname: str
     loss_pct: float
     avg_ms: float | None
+    manual: bool = False
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -249,6 +259,8 @@ class OutageEvent:
         for snap in self.hop_snapshots:
             marker = ">>" if snap.hop == self.bad_hop else "  "
             host = snap.hostname if snap.hostname != snap.ip else snap.ip
+            if snap.manual:
+                host += " [M]"
             rtt = f"{snap.avg_ms:.1f}ms" if snap.avg_ms is not None else "—"
             lines.append(
                 f"    {marker} hop {snap.hop:>2}  {host:<24} loss {snap.loss_pct:>5.1f}%  avg {rtt}"
@@ -260,7 +272,7 @@ def _recent_loss(h: HopStats, window: int = 16) -> float:
     """Compute loss % over the last `window` history entries."""
     if not h.history or h.ip == "*":
         return 100.0
-    recent = list(h.history)[-window:]
+    recent = list(itertools.islice(reversed(h.history), window))
     if not recent:
         return 0.0
     lost = sum(1 for _, rtt in recent if rtt is None)
@@ -282,11 +294,17 @@ def _snapshot_hops(hops: list[HopStats]) -> tuple[list[HopSnapshot], int | None,
     worst_host = ""
     for h in hops:
         if h.ip == "*":
-            snapshots.append(HopSnapshot(h.hop, h.ip, h.hostname, 100.0, None))
+            snapshots.append(
+                HopSnapshot(h.hop, h.ip, h.hostname, 100.0, None, h.manual)
+            )
             continue
         loss = _recent_loss(h)
-        snapshots.append(HopSnapshot(h.hop, h.ip, h.hostname, loss, h.avg_ms))
+        snapshots.append(
+            HopSnapshot(h.hop, h.ip, h.hostname, loss, h.avg_ms, h.manual)
+        )
         host = h.hostname if h.hostname != h.ip else h.ip
+        if h.manual:
+            host += " [M]"
         # Detect bad hop: first hop where loss jumps significantly
         if bad_hop is None and loss > 20 and (loss - prev_loss) > 15:
             bad_hop = h.hop
@@ -361,6 +379,14 @@ class OutageTracker:
 # ─── Route discovery (traceroute) ──────────────────────────────────────────
 
 
+def _resolve_hostname(addr: str) -> str:
+    """Return reverse DNS for an address, falling back to the address itself."""
+    try:
+        return socket.gethostbyaddr(addr)[0]
+    except (socket.herror, socket.gaierror):
+        return addr
+
+
 async def discover_route(
     dest: str, max_hops: int = 30, timeout: float = 2.0, payload_size: int = 56
 ) -> list[HopStats]:
@@ -401,12 +427,7 @@ async def discover_route(
             pass
         finally:
             sock.close()
-        hostname = addr
-        if addr != "*":
-            try:
-                hostname = socket.gethostbyaddr(addr)[0]
-            except (socket.herror, socket.gaierror):
-                hostname = addr
+        hostname = _resolve_hostname(addr) if addr != "*" else addr
         console.print(f"  [dim]{ttl:>2}[/]  {addr:<16} {hostname}")
         hops.append(HopStats(hop=ttl, ip=addr, hostname=hostname))
         if addr == dest_ip:
@@ -416,73 +437,228 @@ async def discover_route(
     return hops
 
 
+def _probe_known_node_ttl(
+    target_ip: str,
+    max_hops: int,
+    timeout: float,
+    payload_size: int,
+    ident: int,
+) -> int | None:
+    """Return the TTL at which *target_ip* answers an ICMP Echo probe."""
+    for ttl in range(1, max_hops + 1):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        except (PermissionError, OSError):
+            return None
+
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            sock.settimeout(timeout)
+            sock.sendto(_build_icmp_packet(ident, ttl, payload_size), (target_ip, 0))
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                try:
+                    data, (resp_addr, _) = sock.recvfrom(1024)
+                except TimeoutError:
+                    break
+                if (
+                    resp_addr == target_ip
+                    and len(data) >= 28
+                    and data[20] == ICMP_ECHO_REPLY
+                    and _extract_reply_ident(data) == ident
+                ):
+                    return ttl
+        except OSError:
+            pass
+        finally:
+            sock.close()
+    return None
+
+
+def _merge_known_nodes(
+    hops: list[HopStats], placements: list[tuple[str, int | None]]
+) -> list[str]:
+    """Merge ordered known-node placements into route gaps and return warnings."""
+    warnings = []
+    hops_by_ttl = {hop.hop: hop for hop in hops}
+    last_hop = max(hops_by_ttl, default=0)
+
+    for ip, ttl in placements:
+        if ttl is None:
+            warnings.append(f"Known node {ip} did not answer; unable to determine TTL")
+            continue
+        if ttl > last_hop or ttl not in hops_by_ttl:
+            warnings.append(
+                f"Known node {ip} resolved to hop {ttl}, beyond the discovered route"
+            )
+            continue
+
+        current = hops_by_ttl[ttl]
+        if current.ip == ip:
+            current.manual = True
+        elif current.ip == "*":
+            replacement = HopStats(
+                hop=ttl,
+                ip=ip,
+                hostname=_resolve_hostname(ip),
+                manual=True,
+            )
+            hops[hops.index(current)] = replacement
+            hops_by_ttl[ttl] = replacement
+        else:
+            warnings.append(
+                f"Known node {ip} resolved to occupied hop {ttl} ({current.ip}); omitted"
+            )
+    return warnings
+
+
+async def add_known_nodes(
+    hops: list[HopStats],
+    known_nodes: list[str],
+    max_hops: int,
+    timeout: float = 2.0,
+    payload_size: int = 56,
+) -> None:
+    """Find known-node TTLs concurrently, then merge them in input order."""
+    if not known_nodes:
+        return
+
+    console = Console(stderr=True)
+    console.print(f"[bold cyan]Locating {len(known_nodes)} known node(s)...[/]")
+    loop = asyncio.get_running_loop()
+    worker_count = min(len(known_nodes), 8)
+    base_ident = os.getpid() & 0xFFFF
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            loop.run_in_executor(
+                executor,
+                _probe_known_node_ttl,
+                ip,
+                max_hops,
+                timeout,
+                payload_size,
+                (base_ident + index + 1) & 0xFFFF,
+            )
+            for index, ip in enumerate(known_nodes)
+        ]
+        ttls = await asyncio.gather(*futures)
+
+    placements = list(zip(known_nodes, ttls, strict=True))
+    for ip, ttl in placements:
+        if ttl is not None:
+            console.print(f"  [dim]hop {ttl:>2}[/]  {ip:<16} [magenta]manual[/]")
+    for warning in _merge_known_nodes(hops, placements):
+        console.print(f"[bold yellow]Warning:[/] {warning}")
+
+
 # ─── Async pinger ───────────────────────────────────────────────────────────
 
 _error_count = 0
 
 
-async def ping_hop(
-    stats: HopStats, ident: int, seq: int, timeout: float = 1.5, payload_size: int = 56
-) -> None:
+async def ping_all_hops(
+    hops: list[HopStats],
+    ident: int,
+    seq: int,
+    timeout: float = 1.5,
+    payload_size: int = 56,
+) -> dict[str, float | None]:
+    """Ping all hops using a single shared socket.
+
+    Sends probes for every hop, then collects replies via select() in one
+    thread.  Returns {target_ip: rtt_ms | None}.
+    """
     global _error_count
-    if stats.ip == "*":
-        return
+
+    active = [h for h in hops if h.ip != "*"]
+    if not active:
+        return {}
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
     except PermissionError:
-        return
+        return {}
 
+    # Build lookup: we need to match replies to the correct hop.
+    # Echo Reply → match by (source IP == target IP)
+    # Time Exceeded → match by embedded original dest IP in the inner header
+    pending: dict[str, float] = {}  # target_ip → send_time
     pkt = _build_icmp_packet(ident, seq, payload_size)
-    target_ip = stats.ip
-    stats.sent += 1
 
-    def _do_ping() -> float | None:
-        """Blocking send+recv in a thread. Returns RTT in ms or None."""
-        t0 = time.monotonic()
-        sock.sendto(pkt, (target_ip, 0))
-        deadline = t0 + timeout
+    def _do_ping_all() -> dict[str, float | None]:
+        """Send all probes, collect replies on one socket. Runs in a thread."""
+        results: dict[str, float | None] = {}
 
-        while True:
+        # Send all probes as fast as possible
+        for h in active:
+            try:
+                sock.sendto(pkt, (h.ip, 0))
+                pending[h.ip] = time.monotonic()
+            except OSError:
+                results[h.ip] = None
+
+        outstanding = set(pending.keys()) - set(results.keys())
+        deadline = time.monotonic() + timeout
+
+        while outstanding:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return None
-            sock.settimeout(remaining)
+                break
+            ready, _, _ = select.select([sock], [], [], remaining)
+            if not ready:
+                break
             try:
                 data, (resp_addr, _) = sock.recvfrom(1024)
             except (socket.timeout, OSError):
-                return None
+                break
 
-            # Must match our ident
             reply_ident = _extract_reply_ident(data)
             if reply_ident != ident:
                 continue
 
+            now = time.monotonic()
             icmp_type = data[20]
-            if icmp_type == ICMP_ECHO_REPLY and resp_addr == target_ip:
-                return (time.monotonic() - t0) * 1000
-            elif icmp_type == ICMP_TIME_EXCEEDED:
-                # Time Exceeded can come from any router — accept from any source
-                return (time.monotonic() - t0) * 1000
-            # else: unrelated ICMP, keep listening
 
+            if icmp_type == ICMP_ECHO_REPLY:
+                # Echo Reply: source is the target itself
+                if resp_addr in outstanding:
+                    results[resp_addr] = (now - pending[resp_addr]) * 1000
+                    outstanding.discard(resp_addr)
+            elif icmp_type == ICMP_TIME_EXCEEDED:
+                # Time Exceeded: source is an intermediate router (which is our hop).
+                # The original dest IP is embedded in the inner IP header at offset 44.
+                if resp_addr in outstanding:
+                    results[resp_addr] = (now - pending[resp_addr]) * 1000
+                    outstanding.discard(resp_addr)
+
+        # Mark remaining as lost
+        for ip in outstanding:
+            results[ip] = None
+        return results
+
+    results: dict[str, float | None]
     try:
         loop = asyncio.get_event_loop()
-        rtt = await asyncio.wait_for(
-            loop.run_in_executor(None, _do_ping),
+        results = await asyncio.wait_for(
+            loop.run_in_executor(None, _do_ping_all),
             timeout=timeout + 0.5,
         )
-        if rtt is not None:
-            stats.record_reply(rtt)
     except asyncio.TimeoutError:
-        pass
+        results = {h.ip: None for h in active}
     except Exception:
         _error_count += 1
+        results = {h.ip: None for h in active}
     finally:
         try:
             sock.close()
         except Exception:
             pass
+
+    return results
 
 
 # ─── Chart ──────────────────────────────────────────────────────────────────
@@ -491,6 +667,16 @@ TIME_RANGES = [15, 30, 60, 120, 300, 600]
 HOP_COLORS = ["cyan", "green", "yellow", "magenta", "blue", "orange", "white", "red+"]
 
 SORT_KEYS = ["hop", "loss%", "avg", "last", "jitter"]
+
+
+def _hop_chart_label(hop: HopStats) -> str:
+    host = hop.hostname if hop.hostname != hop.ip else hop.ip
+    suffix = " [M]" if hop.manual else ""
+    label = f"{hop.hop}:{host}"
+    max_label_len = 22 - len(suffix)
+    if len(label) > max_label_len:
+        label = label[: max_label_len - 2] + ".."
+    return label + suffix
 
 
 def build_chart(hops: list[HopStats], time_range: int, width: int, height: int) -> str:
@@ -529,14 +715,7 @@ def build_chart(hops: list[HopStats], time_range: int, width: int, height: int) 
 
         if times:
             color = HOP_COLORS[i % len(HOP_COLORS)]
-            label = (
-                f"{hop.hop}:{hop.hostname}"
-                if hop.hostname != hop.ip
-                else f"{hop.hop}:{hop.ip}"
-            )
-            # Truncate label to keep legend tidy
-            if len(label) > 22:
-                label = label[:20] + ".."
+            label = _hop_chart_label(hop)
             plt.plot(times, rtts, label=label, color=color)
             has_data = True
 
@@ -581,6 +760,7 @@ def build_table(
         expand=True,
     )
     table.add_column("#", style="dim", width=3, justify="right")
+    table.add_column("Src", style="magenta", width=3, justify="center")
     table.add_column("Host", overflow="ellipsis", no_wrap=True)
     table.add_column("IP", style="dim cyan", min_width=15, no_wrap=True)
     table.add_column("Loss%", justify="right", width=7)
@@ -629,6 +809,7 @@ def build_table(
 
         table.add_row(
             str(h.hop),
+            "M" if h.manual else "",
             h.hostname if h.hostname != h.ip else "—",
             h.ip,
             f"[{loss_style}]{loss:.1f}%[/]",
@@ -665,6 +846,7 @@ def _build_help_panel() -> Panel:
     help_text.append("\n")
     help_text.append("  Columns\n", style="bold cyan")
     cols = [
+        ("M", "Node was supplied with --known-nodes"),
         ("Loss%", "Overall packet loss since start"),
         ("Rcnt%", "Loss since last full outage"),
         ("RAvg", "Average RTT since last full outage"),
@@ -728,6 +910,8 @@ def build_display(
                 for snap in evt.hop_snapshots:
                     if snap.hop == evt.bad_hop:
                         host = snap.hostname if snap.hostname != snap.ip else snap.ip
+                        if snap.manual:
+                            host += " [M]"
                         rtt = f"{snap.avg_ms:.1f}ms" if snap.avg_ms is not None else "—"
                         log_lines.append(
                             f"    ▸▸ hop {snap.hop - 1} → {snap.hop}  {host:<24} "
@@ -745,6 +929,8 @@ def build_display(
                 marker = "▸▸" if is_bad else "  "
                 style = "bold red" if is_bad else "dim"
                 host = snap.hostname if snap.hostname != snap.ip else snap.ip
+                if snap.manual:
+                    host += " [M]"
                 rtt = f"{snap.avg_ms:.1f}ms" if snap.avg_ms is not None else "—"
                 hop_label = (
                     f"{snap.hop - 1} → {snap.hop}" if is_bad else f"{snap.hop:>5}"
@@ -921,6 +1107,11 @@ _WEB_HTML = r"""
   .loss-ok { color: var(--green); }
   .loss-warn { color: var(--yellow); }
   .loss-bad { color: var(--red); font-weight: 700; }
+  .manual-badge {
+    display: inline-block; margin-left: 6px; padding: 0 4px;
+    border: 1px solid #bc8cff; border-radius: 3px;
+    color: #bc8cff; font-size: 9px; line-height: 14px; vertical-align: 1px;
+  }
   .chart-wrap {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: 8px; padding: 10px; margin-bottom: 8px;
@@ -1008,6 +1199,7 @@ _WEB_HTML = r"""
   <div class="row"><span class="key">?</span><span class="desc">Toggle this help panel</span></div>
   <div class="row"><span class="key">click</span><span class="desc">Click host/IP to copy to clipboard</span></div>
   <div class="section">Columns</div>
+  <div class="row"><span class="key">MANUAL</span><span class="desc">Node supplied with --known-nodes</span></div>
   <div class="row"><span class="key">Loss%</span><span class="desc">Overall packet loss since start</span></div>
   <div class="row"><span class="key">Rcnt%</span><span class="desc">Loss since last full outage</span></div>
   <div class="row"><span class="key">RAvg</span><span class="desc">Average RTT since last full outage</span></div>
@@ -1179,10 +1371,11 @@ function renderData(d){
     var c=lc(r.loss_pct);
     var rc=lc(r.recent_loss_pct);
     var flash=r.just_lost?' class="loss-flash"':'';
+    var manual=r.manual?'<span class="manual-badge">MANUAL</span>':'';
     h+='<tr'+flash+'>'
       +'<td>'+r.hop+'</td>'
       +'<td><span class="copyable" data-copy="'+(r.hostname!==r.ip?r.hostname:r.ip)+'">'
-      +(r.hostname!==r.ip?r.hostname:'\u2014')+'</span></td>'
+      +(r.hostname!==r.ip?r.hostname:'\u2014')+'</span>'+manual+'</td>'
       +'<td><span class="copyable" data-copy="'+r.ip+'">'+r.ip+'</span></td>'
       +'<td class="'+c+'">'+r.loss_pct.toFixed(1)+'%</td>'
       +'<td class="'+rc+'">'+r.recent_loss_pct.toFixed(1)+'%</td>'
@@ -1220,6 +1413,7 @@ function renderData(d){
         if(s.ip==='*') continue;
         var ib=s.hop===a.bad_hop;
         var host=s.hostname!==s.ip?s.hostname:s.ip;
+        if(s.manual)host+=' <span class="manual-badge">MANUAL</span>';
         var hopLabel=ib?'hop '+(s.hop-1)+' \u2192 '+s.hop:'hop '+s.hop;
         o+='<div class="snap'+(ib?' is-bad':'')+'">';
         o+=(ib?'\u25b8\u25b8 ':'   ')+hopLabel+'  '+host+'  loss '+s.loss_pct.toFixed(1)+'%  avg '+ms(s.avg);
@@ -1282,6 +1476,7 @@ def _build_web_state(
                 "hop": hp.hop,
                 "ip": hp.ip,
                 "hostname": hp.hostname,
+                "manual": hp.manual,
                 "loss_pct": hp.loss_pct,
                 "recent_loss_pct": hp.recent_loss_pct,
                 "loss_count": hp.sent - hp.received,
@@ -1298,13 +1493,7 @@ def _build_web_state(
         if hp.ip != "*" and hp.history:
             points = []
             loss_x = []
-            label = (
-                f"{hp.hop}:{hp.hostname}"
-                if hp.hostname != hp.ip
-                else f"{hp.hop}:{hp.ip}"
-            )
-            if len(label) > 22:
-                label = label[:20] + ".."
+            label = _hop_chart_label(hp)
             for ts, rtt in hp.history:
                 if ts < cutoff:
                     continue
@@ -1328,6 +1517,7 @@ def _build_web_state(
                     "hop": s.hop,
                     "ip": s.ip,
                     "hostname": s.hostname,
+                    "manual": s.manual,
                     "loss_pct": s.loss_pct,
                     "avg": s.avg_ms,
                 }
@@ -1480,12 +1670,20 @@ async def monitor(
     loss_threshold: float = 20.0,
     outage_duration: float = 1.0,
     pkt_size: int = 64,
+    known_nodes: list[str] | None = None,
 ) -> None:
     payload_size = pkt_size - 8  # ICMP header is 8 bytes
     hops = await discover_route(dest, max_hops=max_hops, payload_size=payload_size)
     if not hops:
         Console(stderr=True).print("[bold red]No route discovered.[/]")
         return
+
+    await add_known_nodes(
+        hops,
+        known_nodes or [],
+        max_hops=max_hops,
+        payload_size=payload_size,
+    )
 
     dest_hop = hops[-1]
     tracker = OutageTracker(threshold_pct=loss_threshold, min_duration=outage_duration)
@@ -1512,6 +1710,9 @@ async def monitor(
     stop = asyncio.Event()
 
     loop = asyncio.get_event_loop()
+    # Bounded thread pool: only need 1 thread for ping batch + 1 for keyboard
+    executor = ThreadPoolExecutor(max_workers=4)
+    loop.set_default_executor(executor)
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
@@ -1538,35 +1739,39 @@ async def monitor(
         while not stop.is_set():
             try:
                 seq += 1
-                prev_states = [(hop.sent, hop.received) for hop in hops]
                 # Track sent for recent stats
                 for hop in hops:
                     if hop.ip != "*":
+                        hop.sent += 1
                         hop.record_sent()
 
-                await asyncio.gather(
-                    *(
-                        ping_hop(hop, ident, seq, payload_size=payload_size)
-                        for hop in hops
-                    ),
-                    return_exceptions=True,
+                results = await ping_all_hops(
+                    hops, ident, seq, payload_size=payload_size
                 )
 
                 now_mono = time.monotonic()
-                for i, hop in enumerate(hops):
-                    _, prev_recv = prev_states[i]
-                    if hop.received > prev_recv:
+                for hop in hops:
+                    if hop.ip == "*":
+                        continue
+                    rtt = results.get(hop.ip)
+                    if rtt is not None:
+                        hop.record_reply(rtt)
                         hop.history.append((now_mono, hop.last_ms))
                     else:
                         hop.history.append((now_mono, None))
-                        if hop.ip != "*":
-                            hop.mark_loss()
+                        hop.mark_loss()
 
                 # Check for full outage (dest 100% loss) to reset recent counters
-                dest_got_reply = dest_hop.received > prev_states[-1][1]
+                dest_rtt = results.get(dest_hop.ip) if dest_hop.ip != "*" else None
+                dest_got_reply = dest_rtt is not None
                 if not dest_got_reply:
                     all_dest_lost = (
-                        all(rtt is None for _, rtt in list(dest_hop.history)[-8:])
+                        all(
+                            rtt is None
+                            for _, rtt in itertools.islice(
+                                reversed(dest_hop.history), 8
+                            )
+                        )
                         if len(dest_hop.history) >= 8
                         else False
                     )
@@ -1576,8 +1781,8 @@ async def monitor(
 
                 tracker.record(dest_got_reply, hops=hops)
 
-                # Push to web clients
-                if not time_state["paused"]:
+                # Push to web clients (skip serialization when nobody is listening)
+                if not time_state["paused"] and _sse_clients:
                     _push_sse(_build_web_state(hops, dest, tracker, seq, start_time))
 
                 tw, th = console.size
@@ -1631,6 +1836,36 @@ async def monitor(
             console.print(f"  ● {evt.fmt_detail()}")
 
 
+def _parse_known_nodes(groups: list[list[str]]) -> list[str]:
+    """Flatten, validate, canonicalize, and de-duplicate known IPv4 nodes."""
+    nodes = []
+    seen = set()
+    for group in groups:
+        for value in group:
+            parts = value.split(",")
+            if any(not part.strip() for part in parts):
+                raise argparse.ArgumentTypeError(
+                    f"invalid known-node list {value!r}: empty IP address"
+                )
+            for part in parts:
+                candidate = part.strip()
+                try:
+                    address = ipaddress.ip_address(candidate)
+                except ValueError as exc:
+                    raise argparse.ArgumentTypeError(
+                        f"invalid known-node IPv4 address: {candidate}"
+                    ) from exc
+                if not isinstance(address, ipaddress.IPv4Address):
+                    raise argparse.ArgumentTypeError(
+                        f"known nodes must be IPv4 addresses: {candidate}"
+                    )
+                canonical = str(address)
+                if canonical not in seen:
+                    seen.add(canonical)
+                    nodes.append(canonical)
+    return nodes
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="pmtr – network path monitor with charts",
@@ -1656,6 +1891,17 @@ def main() -> None:
         type=int,
         default=30,
         help="Maximum TTL / hop count (default: 30)",
+    )
+    parser.add_argument(
+        "--known-nodes",
+        nargs="+",
+        action="append",
+        default=[],
+        metavar="IP",
+        help=(
+            "Known path-node IPv4 addresses; accepts spaces, commas, and repeated "
+            "options"
+        ),
     )
     parser.add_argument(
         "-w",
@@ -1699,6 +1945,10 @@ def main() -> None:
         help="ICMP packet size in bytes including header (default: 64)",
     )
     args = parser.parse_args()
+    try:
+        known_nodes = _parse_known_nodes(args.known_nodes)
+    except argparse.ArgumentTypeError as exc:
+        parser.error(str(exc))
 
     if os.geteuid() != 0:
         Console(stderr=True).print(
@@ -1718,6 +1968,7 @@ def main() -> None:
             loss_threshold=args.loss_threshold,
             outage_duration=args.outage_duration,
             pkt_size=args.size,
+            known_nodes=known_nodes,
         )
     )
 

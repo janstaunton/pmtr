@@ -14,6 +14,7 @@ Publishing this is mostly an effort to amortise the token cost of generating it 
 ## Features
 
 - **Traceroute + continuous ping** — discovers every hop to the destination, then monitors them all in parallel
+- **Known path nodes** — place supplied IPv4 nodes into traceroute gaps using TTL probes and monitor them normally
 - **Rich terminal UI** — colour-coded loss/latency table with real-time updates via [Rich](https://github.com/Textualize/rich)
 - **Latency charts** — inline ASCII charts powered by [plotext](https://github.com/piccolomo/plotext), adjustable from 15 s to 10 min
 - **Web dashboard** — a self-contained HTML dashboard served over HTTP with live Chart.js graphs and Server-Sent Events; works from any browser on the network
@@ -50,6 +51,7 @@ sudo uv run pmtr.py [destination] [options]
 | `destination` | `8.8.8.8` | Target host or IP address |
 | `-i`, `--interval` | `0.25` | Ping interval in seconds |
 | `-m`, `--max-hops` | `30` | Maximum TTL / hop count |
+| `--known-nodes IP [IP ...]` | none | Known IPv4 path nodes; accepts spaces, commas, and repeated options |
 | `-s`, `--size` | `64` | ICMP packet size in bytes (including header) |
 | `-c`, `--chart` / `--no-chart` | off | Show the terminal chart on startup |
 | `-w`, `--web` / `--no-web` | on | Start the web dashboard |
@@ -68,6 +70,12 @@ sudo uv run pmtr.py 8.8.8.8 --size 1400 --no-web
 
 # Lower outage sensitivity
 sudo uv run pmtr.py example.com --loss-threshold 50 --outage-duration 5
+
+# Add known routers that normal traceroute leaves hidden
+sudo uv run pmtr.py 8.8.8.8 --known-nodes 10.0.0.1 192.0.2.10
+
+# Comma-separated and repeated forms can be combined
+sudo uv run pmtr.py 8.8.8.8 --known-nodes 10.0.0.1,192.0.2.10 --known-nodes 198.51.100.5
 ```
 
 ## Keyboard Controls
@@ -104,6 +112,8 @@ The dashboard uses **Server-Sent Events** for real-time updates with automatic r
 | **Avg** | Average RTT since start |
 | **RAvg** | Average RTT since last full outage |
 | **Jtr** | Jitter — standard deviation of recent RTT samples |
+
+Nodes successfully placed from `--known-nodes` are marked **M** in the terminal and **MANUAL** in the web dashboard. A supplied node is only inserted into a `*` gap (or marked when normal discovery found the same IP); conflicting or unresponsive nodes produce a warning and are omitted.
 
 ## Linting
 
