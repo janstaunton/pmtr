@@ -760,7 +760,6 @@ def build_table(
         expand=True,
     )
     table.add_column("#", style="dim", width=3, justify="right")
-    table.add_column("Src", style="magenta", width=3, justify="center")
     table.add_column("Host", overflow="ellipsis", no_wrap=True)
     table.add_column("IP", style="dim cyan", min_width=15, no_wrap=True)
     table.add_column("Loss%", justify="right", width=7)
@@ -807,10 +806,13 @@ def build_table(
         def fmt(v: float | None) -> str:
             return f"{v:.1f} ms" if v is not None else "—"
 
+        host = h.hostname if h.hostname != h.ip else "—"
+        if h.manual:
+            host = f"[magenta]M[/] {host}"
+
         table.add_row(
             str(h.hop),
-            "M" if h.manual else "",
-            h.hostname if h.hostname != h.ip else "—",
+            host,
             h.ip,
             f"[{loss_style}]{loss:.1f}%[/]",
             f"[{recent_style}]{recent_loss:.1f}%[/]",

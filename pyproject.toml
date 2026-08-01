@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pmtr"
+version = "0.1.0"
+description = "A lightweight MTR-like network path monitor with live charts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Jan Staunton" }]
+dependencies = [
+    "plotext",
+    "rich",
+]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.urls]
+Homepage = "https://github.com/janstaunton/pmtr"
+Repository = "https://github.com/janstaunton/pmtr.git"
+
+[project.scripts]
+pmtr = "pmtr:main"
+
+[tool.setuptools]
+py-modules = ["pmtr"]

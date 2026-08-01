@@ -40,10 +40,40 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 sudo uv run pmtr.py 8.8.8.8
 ```
 
+## Install with uv
+
+Install `pmtr` as a user-wide command directly from GitHub:
+
+```bash
+uv tool install git+https://github.com/janstaunton/pmtr.git
+uv tool update-shell
+```
+
+For development, install the current checkout instead:
+
+```bash
+uv tool install .
+```
+
+The installed command still needs root privileges for raw ICMP sockets. Use its absolute path in case `sudo` does not preserve your user tool directory in `PATH`:
+
+```bash
+sudo "$(uv tool dir --bin)/pmtr" 8.8.8.8
+```
+
+To upgrade or uninstall it later:
+
+```bash
+uv tool upgrade pmtr
+uv tool uninstall pmtr
+```
+
 ## Usage
 
 ```
 sudo uv run pmtr.py [destination] [options]
+# or, after installation:
+sudo "$(uv tool dir --bin)/pmtr" [destination] [options]
 ```
 
 | Option | Default | Description |
@@ -113,7 +143,7 @@ The dashboard uses **Server-Sent Events** for real-time updates with automatic r
 | **RAvg** | Average RTT since last full outage |
 | **Jtr** | Jitter — standard deviation of recent RTT samples |
 
-Nodes successfully placed from `--known-nodes` are marked **M** in the terminal and **MANUAL** in the web dashboard. A supplied node is only inserted into a `*` gap (or marked when normal discovery found the same IP); conflicting or unresponsive nodes produce a warning and are omitted.
+Nodes successfully placed from `--known-nodes` are marked **M** inside the terminal's **Host** column and **MANUAL** inside the web dashboard's Host cell. A supplied node is only inserted into a `*` gap (or marked when normal discovery found the same IP); conflicting or unresponsive nodes produce a warning and are omitted.
 
 ## Linting
 

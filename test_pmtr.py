@@ -1,4 +1,5 @@
 import argparse
+import io
 import json
 import unittest
 from unittest.mock import patch
@@ -121,6 +122,19 @@ class KnownNodeProbeTests(unittest.TestCase):
 
 
 class ManualProvenanceTests(unittest.TestCase):
+    def test_terminal_table_puts_manual_marker_in_host_column(self):
+        hop = pmtr.HopStats(2, "192.0.2.2", "known-router", manual=True)
+
+        table = pmtr.build_table([hop], "203.0.113.10")
+
+        headers = [str(column.header) for column in table.columns]
+        console = pmtr.Console(record=True, width=140, file=io.StringIO())
+        console.print(table)
+        rendered = console.export_text()
+        self.assertNotIn("Src", headers)
+        self.assertEqual(headers[1], "Host")
+        self.assertIn("M known-router", rendered)
+
     def test_stats_snapshots_and_web_state_retain_manual_flag(self):
         hop = pmtr.HopStats(2, "192.0.2.2", "known-router", manual=True)
         hop.sent = 1
